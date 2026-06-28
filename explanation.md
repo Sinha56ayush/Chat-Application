@@ -156,9 +156,32 @@ The client sidebar re-renders on every `userList` event, so all connected users 
 
 ### Why is online status tied to user login state specifically?
 
-The `isOnline` flag is not set when the socket connects — it is set only after the `login` event fires and credentials are verified. This means simply opening the app does not mark someone online. They must successfully authenticate first. Equally, when the socket disconnects (tab close, refresh, network drop), the server's `disconnect` handler automatically sets `isOnline = false` — no explicit logout action is needed from the user.
+The `isOnline` flag is not set when the socket connects — it is set only after the `login` event fires and credentials are verified. This means simply opening the app does not mark someone online. They must successfully authenticate first:
 
-This is why the `socketId` is stored in the User document. When a disconnect happens, Socket.IO only tells the server which `socket.id` dropped. The server uses that to look up which user it belongs to and updates their status accordingly.
+```js
+socket.on('login', async ({ username, password }) => {
+  // after credential check passes...
+  user.socketId = socket.id;
+  user.isOnline = true;
+  user.lastSeen = new Date();
+  await user.save();
+});
+```
+
+Equally, when the socket disconnects (tab close, refresh, network drop), the server's `disconnect` handler automatically sets `isOnline = false` — no explicit logout action is needed from the user:
+
+```js
+socket.on('disconnect', async () => {
+  const user = await User.findOne({ socketId: socket.id });
+  if (user) {
+    user.isOnline = false;
+    user.lastSeen = new Date();
+    await user.save();
+  }
+});
+```
+
+This is why `socketId` is stored in the User document. When a disconnect happens, Socket.IO only tells the server which `socket.id` dropped. The server uses that to look up which user it belongs to and updates their status accordingly.
 
 ### What happens if the server crashes while a user is online?
 
@@ -196,11 +219,41 @@ Multiple users can type at the same time. The Map lets you track each user indep
 
 ### Why debounce with setTimeout instead of emitting on every keystroke?
 
-If the app emitted a socket event on every single keystroke, a fast typist writing a sentence could fire 50–60 events per second. This would flood the server and every connected client with events constantly. The debounce pattern batches this — it only emits once when typing starts, and once again after typing stops (1 second of silence). So no matter how fast or long someone types, only 2 events are emitted per typing session.
+If the app emitted a socket event on every single keystroke, a fast typist writing a sentence could fire 50–60 events per second. This would flood the server and every connected client with events constantly. The debounce pattern batches this — it only emits once when typing starts, and once again after typing stops (1 second of silence):
+
+```js
+const handleTyping = (e) => {
+  setNewMessage(e.target.value);
+
+  if (!isTyping) {
+    setIsTyping(true);
+    socketRef.current?.emit('typing', true);  // emits only on first keystroke
+  }
+
+  if (typingTimeoutRef.current) {
+    clearTimeout(typingTimeoutRef.current);   // reset the clock on every keystroke
+  }
+
+  typingTimeoutRef.current = setTimeout(() => {
+    setIsTyping(false);
+    socketRef.current?.emit('typing', false); // emits only after 1s of silence
+  }, 1000);
+};
+```
+
+So no matter how fast or long someone types, only 2 socket events are emitted per typing session — one when they start, one when they stop.
 
 ### Why use `socket.broadcast.emit` here instead of `io.emit`?
 
-`socket.broadcast.emit` sends to everyone **except the sender**. There is no point in telling Alice that Alice is typing — she already knows. `io.emit` would send it back to her too, which is unnecessary noise.
+`socket.broadcast.emit` sends to everyone **except the sender**. There is no point in telling Alice that Alice is typing — she already knows. `io.emit` would send it back to her too, which is unnecessary:
+
+```js
+// correct — everyone except Alice gets the event
+socket.broadcast.emit('userTyping', { socketId, username, isTyping });
+
+// wrong — Alice would also receive her own typing event
+io.emit('userTyping', { socketId, username, isTyping });
+```
 
 ---
 
